@@ -1,5 +1,6 @@
 use log::LevelFilter;
 use std::collections::HashMap;
+use std::env;
 use std::path::Path;
 use std::time::Duration;
 use toml::Value;
@@ -48,6 +49,15 @@ impl Default for ServiceDefault {
             retry: DEFAULT_RETRY,
             cooldown: DEFAULT_COOLDOWN,
         }
+    }
+}
+
+/// 解析环境变量引用：$VAR_NAME
+fn resolve_env_var(value: &str) -> String {
+    if let Some(var_name) = value.strip_prefix('$') {
+        env::var(var_name).unwrap_or_else(|_| value.to_string())
+    } else {
+        value.to_string()
     }
 }
 
@@ -177,7 +187,7 @@ impl Config {
                     let api_key = table
                         .get("api-key")
                         .and_then(Value::as_str)
-                        .map(|s| s.into());
+                        .map(|s| resolve_env_var(s).into());
                     let model = table.get("model").and_then(Value::as_str).map(|s| s.into());
 
                     // 解析 retry（未指定时使用默认值）
@@ -491,8 +501,8 @@ retry = 5
 cooldown = "30s"
 
 [router]
-Qwen3.5-35B-A3B = ["model1-local", "aliyun"]
-Qwen3.5-122B-A10B = ["model2-local", "aliyun"]
+model1 = ["model1-local", "aliyun"]
+model2 = ["model2-local", "aliyun"]
 "#;
         let config = Config::from_str(content).unwrap();
 
@@ -511,7 +521,7 @@ Qwen3.5-122B-A10B = ["model2-local", "aliyun"]
         assert_eq!(aliyun.cooldown, Duration::from_secs(30));
         assert_eq!(config.router.len(), 2);
 
-        let qwen35b = config.router.get("Qwen3.5-35B-A3B").unwrap();
+        let qwen35b = config.router.get("model1").unwrap();
         assert_eq!(qwen35b.backends.len(), 2);
         assert_eq!(qwen35b.backends[0].as_ref(), "model1-local");
         assert_eq!(qwen35b.backends[1].as_ref(), "aliyun");
