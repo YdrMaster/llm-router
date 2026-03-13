@@ -1,5 +1,5 @@
 ﻿[service]
-port = 9000         # 路由监听的端口
+port = 8000         # 路由监听的端口
 log_level = "trace" # trace | debug | *info | warn | error | off
 
 [service.default]
@@ -12,10 +12,11 @@ sglang-qwen3.5-122B-A10B = "http://172.17.250.163:30000"
 
 [backend.aliyun]
 base-url = "https://dashscope.aliyuncs.com/apps/anthropic"
-api-key = "sk-"
+api-key = "$ALIYUN_API_KEY"
 retry = 5
 cooldown = "30s"
 
 [router]
+"data/Qwen3.5-35B-A3B" = "Qwen3.5-35B-A3B"
 Qwen3.5-35B-A3B = ["sglang-qwen3.5-35B-A3B", "aliyun"]
 Qwen3.5-122B-A10B = ["sglang-qwen3.5-122B-A10B", "aliyun"]

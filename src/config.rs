@@ -1,5 +1,5 @@
-use log::LevelFilter;
-use std::collections::HashMap;
+use log::{LevelFilter, warn};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::Path;
 use std::time::Duration;
@@ -9,7 +9,8 @@ use toml::Value;
 pub struct Config {
     pub service: ServiceConfig,
     pub backend: HashMap<String, BackendConfig>,
-    pub router: HashMap<String, RouteGroup>,
+    pub aliases: HashMap<String, Box<str>>,
+    pub router: HashMap<String, Box<[Box<str>]>>,
     _default: ServiceDefault,
 }
 
@@ -26,11 +27,6 @@ pub struct BackendConfig {
     pub model: Option<Box<str>>,
     pub retry: usize,
     pub cooldown: Duration,
-}
-
-#[derive(Debug)]
-pub struct RouteGroup {
-    pub backends: Vec<Box<str>>,
 }
 
 /// 默认服务配置
@@ -50,6 +46,11 @@ impl Default for ServiceDefault {
             cooldown: DEFAULT_COOLDOWN,
         }
     }
+}
+
+enum RouteTarget {
+    Alias(Box<str>),
+    Backends(Box<[Box<str>]>),
 }
 
 /// 解析环境变量引用：$VAR_NAME
@@ -221,32 +222,99 @@ impl Config {
         }
 
         // 解析 router 部分（可选）
-        let mut router = HashMap::new();
+        // 阶段 1: 解析原始路由条目到临时结构
+        let mut raw_router: HashMap<String, RouteTarget> = HashMap::new();
         if let Some(router_value) = value.get("router") {
             let router_table = router_value.as_table().ok_or("[router] must be a table")?;
             let router_flat = flatten_table(router_table, "");
 
             for (key, val) in router_flat {
-                let backends = val
-                    .as_array()
-                    .ok_or("router values must be arrays")?
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(|s| s.into())
-                            .ok_or("router array values must be strings")
-                    })
-                    .collect::<Result<_, _>>()?;
-                router.insert(key, RouteGroup { backends });
+                let target = if let Some(next) = val.as_str() {
+                    RouteTarget::Alias(next.into())
+                } else if let Some(arr) = val.as_array() {
+                    RouteTarget::Backends(
+                        arr.iter()
+                            .map(|v| {
+                                v.as_str()
+                                    .map(|s| s.into())
+                                    .ok_or("router array values must be strings")
+                            })
+                            .collect::<Result<_, _>>()?,
+                    )
+                } else {
+                    return Err("Invalid route format".into());
+                };
+                raw_router.insert(key, target);
+            }
+        }
+
+        // 阶段 2: 展开别名链并分离到 aliases 和 router 表
+        let mut aliases = HashMap::new();
+        let mut router = HashMap::new();
+
+        for (key, target) in &raw_router {
+            match target {
+                RouteTarget::Backends(backends) => {
+                    router.insert(key.clone(), backends.clone());
+                }
+                RouteTarget::Alias(alias_target) => {
+                    match resolve_alias_chain(&raw_router, alias_target) {
+                        Ok(final_route) => {
+                            aliases.insert(key.clone(), final_route);
+                        }
+                        Err(e) => {
+                            warn!("Skipping invalid alias '{key}': {e}")
+                        }
+                    }
+                }
             }
         }
 
         Ok(Config {
             service: ServiceConfig { port, log_level },
             backend,
+            aliases,
             router,
             _default: default,
         })
+    }
+}
+
+/// 展开别名链，返回最终的路由名
+///
+/// 如果检测到循环引用或目标路由不存在，返回 Err
+fn resolve_alias_chain(
+    raw_router: &HashMap<String, RouteTarget>,
+    start: &str,
+) -> Result<Box<str>, String> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    let mut path = Vec::new();
+
+    loop {
+        // 如果当前节点已经在访问历史中，说明有循环
+        if !visited.insert(current) {
+            // 找到循环的起点
+            let cycle_start = path.iter().position(|p| *p == current).unwrap();
+            return Err(format!(
+                "Detected circular alias reference: {} → {current}",
+                path[cycle_start..].join("->")
+            ));
+        }
+
+        path.push(current);
+
+        match raw_router.get(current) {
+            Some(RouteTarget::Alias(next)) => {
+                current = &*next;
+            }
+            Some(RouteTarget::Backends(_)) => {
+                return Ok(current.into()); // 找到最终路由名
+            }
+            None => {
+                return Err(format!("Route '{current}' does not exist"));
+            }
+        }
     }
 }
 
@@ -369,14 +437,14 @@ Model-B = ["backend2"]
 
         assert_eq!(config.router.len(), 2);
 
-        let model_a = config.router.get("Model-A").unwrap();
-        assert_eq!(model_a.backends.len(), 2);
-        assert_eq!(model_a.backends[0].as_ref(), "backend1");
-        assert_eq!(model_a.backends[1].as_ref(), "backend2");
+        let backends = config.router.get("Model-A").unwrap();
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].as_ref(), "backend1");
+        assert_eq!(backends[1].as_ref(), "backend2");
 
-        let model_b = config.router.get("Model-B").unwrap();
-        assert_eq!(model_b.backends.len(), 1);
-        assert_eq!(model_b.backends[0].as_ref(), "backend2");
+        let backends = config.router.get("Model-B").unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].as_ref(), "backend2");
     }
 
     /// 测试时间字符串解析
@@ -393,6 +461,119 @@ Model-B = ["backend2"]
         assert_eq!(parse_duration(""), None);
     }
 
+    /// 测试别名配置
+    #[test]
+    fn test_alias_config() {
+        let content = r#"
+[service]
+port = 8000
+
+[backend]
+backend1 = "http://1.2.3.4:30000"
+backend2 = "http://1.2.3.4:30001"
+
+[router]
+Model-A = ["backend1", "backend2"]
+alias-model = "Model-A"
+"#;
+        let config = Config::from_str(content).unwrap();
+
+        // 路由表应该只有 1 个条目 (Model-A)
+        assert_eq!(config.router.len(), 1);
+        assert!(config.router.contains_key("Model-A"));
+
+        // 别名表应该有 1 个条目
+        assert_eq!(config.aliases.len(), 1);
+        assert_eq!(
+            config.aliases.get("alias-model").map(|s| s.as_ref()),
+            Some("Model-A")
+        );
+    }
+
+    /// 测试别名链展开
+    #[test]
+    fn test_alias_chain() {
+        let content = r#"
+[service]
+port = 8000
+
+[backend]
+backend1 = "http://1.2.3.4:30000"
+
+[router]
+real-model = ["backend1"]
+alias1 = "real-model"
+alias2 = "alias1"
+alias3 = "alias2"
+"#;
+        let config = Config::from_str(content).unwrap();
+
+        // 路由表应该只有 1 个条目
+        assert_eq!(config.router.len(), 1);
+
+        // 别名表应该有 3 个条目，都指向 real-model
+        assert_eq!(config.aliases.len(), 3);
+        assert_eq!(
+            config.aliases.get("alias1").map(|s| s.as_ref()),
+            Some("real-model")
+        );
+        assert_eq!(
+            config.aliases.get("alias2").map(|s| s.as_ref()),
+            Some("real-model")
+        );
+        assert_eq!(
+            config.aliases.get("alias3").map(|s| s.as_ref()),
+            Some("real-model")
+        );
+    }
+
+    /// 测试循环引用检测
+    #[test]
+    fn test_alias_cycle_detection() {
+        let content = r#"
+[service]
+port = 8000
+
+[backend]
+backend1 = "http://1.2.3.4:30000"
+
+[router]
+real-model = ["backend1"]
+alias1 = "alias2"
+alias2 = "alias1"
+"#;
+        let config = Config::from_str(content).unwrap();
+
+        // 路由表应该只有 1 个条目
+        assert_eq!(config.router.len(), 1);
+
+        // 别名表应该是空的 (循环引用被拒绝)
+        assert_eq!(config.aliases.len(), 0);
+    }
+
+    /// 测试不存在的目标
+    #[test]
+    fn test_alias_nonexistent_target() {
+        let content = r#"
+[service]
+port = 8000
+
+[backend]
+backend1 = "http://1.2.3.4:30000"
+
+[router]
+real-model = ["backend1"]
+alias1 = "nonexistent"
+"#;
+        let config = Config::from_str(content).unwrap();
+
+        // 路由表应该只有 1 个条目
+        assert_eq!(config.router.len(), 1);
+
+        // 别名表应该是空的 (目标不存在被拒绝)
+        assert_eq!(config.aliases.len(), 0);
+    }
+
     /// 测试带点号的键名
     #[test]
     fn test_dotted_key_names() {
@@ -405,8 +586,8 @@ model1-local = "http://1.2.3.4:30000"
 model2-local = "http://1.2.3.4:30001"
 
 [router]
-Qwen3.5-35B-A3B = ["model1-local"]
-Qwen3.5-122B-A10B = ["model2-local"]
+model1 = ["model1-local"]
+model2 = ["model2-local"]
 "#;
         let config = Config::from_str(content).unwrap();
 
@@ -414,8 +595,8 @@ Qwen3.5-122B-A10B = ["model2-local"]
         assert!(config.backend.contains_key("model1-local"));
         assert!(config.backend.contains_key("model2-local"));
         assert_eq!(config.router.len(), 2);
-        assert!(config.router.contains_key("Qwen3.5-35B-A3B"));
-        assert!(config.router.contains_key("Qwen3.5-122B-A10B"));
+        assert!(config.router.contains_key("model1"));
+        assert!(config.router.contains_key("model2"));
     }
 
     /// 测试混合后端配置
@@ -521,9 +702,9 @@ model2 = ["model2-local", "aliyun"]
         assert_eq!(aliyun.cooldown, Duration::from_secs(30));
         assert_eq!(config.router.len(), 2);
 
-        let qwen35b = config.router.get("model1").unwrap();
-        assert_eq!(qwen35b.backends.len(), 2);
-        assert_eq!(qwen35b.backends[0].as_ref(), "model1-local");
-        assert_eq!(qwen35b.backends[1].as_ref(), "aliyun");
+        let backends = config.router.get("model1").unwrap();
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].as_ref(), "model1-local");
+        assert_eq!(backends[1].as_ref(), "aliyun");
     }
 }

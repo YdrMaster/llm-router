@@ -18,7 +18,7 @@ use hyper_util::rt::TokioIo;
 use log::{info, warn};
 use tokio::net::TcpListener;
 
-use crate::config::{BackendConfig, Config, RouteGroup};
+use crate::config::{BackendConfig, Config};
 use crate::health::BackendHealth;
 use crate::protocol::{AnthropicProtocol, ModelInfo, OpenAiProtocol, Protocol};
 
@@ -28,7 +28,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 #[derive(Clone)]
 struct Server {
     backends: Arc<HashMap<String, Backend>>,
-    router: Arc<HashMap<String, RouteGroup>>,
+    aliases: Arc<HashMap<String, Box<str>>>,
+    router: Arc<HashMap<String, Box<[Box<str>]>>>,
     protocols: Vec<Arc<dyn Protocol>>,
     http_client: Client<HttpConnector, Full<Bytes>>,
 }
@@ -63,6 +64,7 @@ impl Server {
 
         Server {
             backends: Arc::new(backends),
+            aliases: Arc::new(config.aliases),
             router: Arc::new(config.router),
             protocols,
             http_client,
@@ -71,10 +73,14 @@ impl Server {
 
     /// 查找给定模型名称的第一个健康后端
     fn find_backend(&self, model: &str) -> Option<(String, &Backend)> {
-        let route = self.router.get(model)?;
+        // 先查别名表，获取最终的路由名
+        let route_name = self.aliases.get(model).map_or(model, |v| v.as_ref());
+
+        // 查路由表获取后端列表
+        let backends = self.router.get(route_name)?;
 
         // 按顺序遍历后端，查找第一个健康的后端
-        for backend_name in &route.backends {
+        for backend_name in backends.iter() {
             let name = backend_name.as_ref();
             if let Some(backend) = self.backends.get(name)
                 && backend.health.is_healthy()
@@ -84,7 +90,7 @@ impl Server {
         }
 
         // 所有后端都不健康，仍然返回第一个（可能会失败）
-        let backend_name = route.backends.first()?.as_ref();
+        let backend_name = backends.first()?.as_ref();
         let backend = self.backends.get(backend_name)?;
         Some((backend_name.to_string(), backend))
     }
@@ -128,7 +134,7 @@ impl Server {
     }
 
     pub async fn serve(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let port = self.backends.iter().next().map(|_| 8000).unwrap_or(8000); // Placeholder
+        let port = self.backends.iter().next().map(|_| 8000).unwrap_or(8000);
         let addr = SocketAddr::from(([0, 0, 0, 0], port as u16));
         let listener = TcpListener::bind(addr).await?;
         info!("Listening on http://{}", addr);
@@ -181,7 +187,7 @@ impl Server {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        info!("{} {}", method, path);
+        info!("{method} {path}");
 
         // 处理 GET 请求获取模型列表
         if method == Method::GET {
@@ -212,7 +218,7 @@ impl Server {
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                warn!("Failed to collect request body: {}", e);
+                warn!("Failed to collect request body: {e}");
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .header(CONTENT_TYPE, "text/plain")
@@ -238,15 +244,13 @@ impl Server {
                         break;
                     }
                     Err(e) => {
-                        warn!("Failed to parse request: {}", e);
+                        warn!("Failed to parse request: {e}");
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .header(CONTENT_TYPE, "text/plain")
                             .body(
-                                Full::from(format!("Invalid request: {}", e))
-                                    .map_err(|_| {
-                                        std::io::Error::other("error")
-                                    })
+                                Full::from(format!("Invalid request: {e}"))
+                                    .map_err(|_| std::io::Error::other("error"))
                                     .boxed(),
                             )
                             .unwrap());
@@ -256,10 +260,7 @@ impl Server {
         }
 
         if !matched {
-            warn!(
-                "No matching protocol for path: {}, content-type: {:?}",
-                path, content_type
-            );
+            warn!("No matching protocol for path: {path}, content-type: {content_type:?}");
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header(CONTENT_TYPE, "text/plain")
@@ -286,6 +287,10 @@ impl Server {
     ) -> Result<Response<BoxBody>, std::io::Error> {
         let mut tried_backends: Vec<String> = Vec::new();
 
+        // 解析模型名（处理别名）
+        let route_name = self.aliases.get(model_name).map_or(model_name, |v| v.as_ref());
+        let backends_list = self.router.get(route_name);
+
         loop {
             // 查找下一个要尝试的后端
             let backend_result = if tried_backends.is_empty() {
@@ -293,8 +298,8 @@ impl Server {
             } else {
                 // 尝试查找尚未尝试的后端
                 let mut next_backend = None;
-                if let Some(route) = self.router.get(model_name) {
-                    for backend_name in &route.backends {
+                if let Some(backends) = backends_list {
+                    for backend_name in backends.iter() {
                         let name = backend_name.as_ref();
                         if !tried_backends.contains(&name.to_string())
                             && let Some(backend) = self.backends.get(name)
@@ -311,15 +316,13 @@ impl Server {
                 Some(b) => b,
                 None => {
                     // 没有更多后端可尝试
-                    warn!("All backends failed for model: {}", model_name);
+                    warn!("All backends failed for model: {model_name}");
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
                         .header(CONTENT_TYPE, "text/plain")
                         .body(
                             Full::from("All backends unavailable")
-                                .map_err(|_| {
-                                    std::io::Error::other("error")
-                                })
+                                .map_err(|_| std::io::Error::other("error"))
                                 .boxed(),
                         )
                         .unwrap());
@@ -327,8 +330,8 @@ impl Server {
             };
 
             info!(
-                "Trying backend: {} (retry={}, cooldown={:?})",
-                backend_name, backend.config.retry, backend.config.cooldown
+                "Trying backend: {backend_name} (retry={}, cooldown={:?})",
+                backend.config.retry, backend.config.cooldown
             );
             tried_backends.push(backend_name.clone());
 
@@ -348,15 +351,15 @@ impl Server {
                     // 检查响应是否表示错误（5xx 状态）
                     let status = response.status();
                     if status.is_server_error() {
-                        warn!("Backend {} returned server error: {}", backend_name, status);
+                        warn!("Backend {backend_name} returned server error: {status}");
 
                         // 记录失败并检查是否应进入冷却
                         if backend.health.record_failure(backend.config.retry) {
                             // 进入冷却
                             backend.health.set_cooldown(backend.config.cooldown);
                             warn!(
-                                "Backend {} entered cooldown for {:?}",
-                                backend_name, backend.config.cooldown
+                                "Backend {backend_name} entered cooldown for {:?}",
+                                backend.config.cooldown
                             );
                         }
                         // 继续循环尝试下一个后端
@@ -370,15 +373,15 @@ impl Server {
                 }
                 Err(_) => {
                     // 重试后后端连接仍失败
-                    warn!("Backend {} failed after retries", backend_name);
+                    warn!("Backend {backend_name} failed after retries");
 
                     // 记录失败并检查是否应进入冷却
                     if backend.health.record_failure(backend.config.retry) {
                         // 进入冷却
                         backend.health.set_cooldown(backend.config.cooldown);
                         warn!(
-                            "Backend {} entered cooldown for {:?}",
-                            backend_name, backend.config.cooldown
+                            "Backend {backend_name} entered cooldown for {:?}",
+                            backend.config.cooldown
                         );
                     }
                     // 继续循环尝试下一个后端
@@ -401,10 +404,9 @@ impl Server {
         for attempt in 0..backend.config.retry {
             if attempt > 0 {
                 info!(
-                    "Retry {}/{} for backend {}",
+                    "Retry {}/{} for backend {backend_name}",
                     attempt + 1,
                     backend.config.retry,
-                    backend_name
                 );
             }
 
@@ -424,10 +426,8 @@ impl Server {
                 }
                 Err(e) => {
                     warn!(
-                        "Attempt {} failed for backend {}: {}",
+                        "Attempt {} failed for backend {backend_name}: {e}",
                         attempt + 1,
-                        backend_name,
-                        e
                     );
                     // 继续下一次重试
                 }
@@ -435,8 +435,8 @@ impl Server {
         }
 
         warn!(
-            "Backend {} failed after {} attempts",
-            backend_name, backend.config.retry
+            "Backend {backend_name} failed after {} attempts",
+            backend.config.retry
         );
         Err(std::io::Error::other("error"))
     }
@@ -476,13 +476,12 @@ impl Server {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
 
-                info!("Backend {} response status: {}", backend_name, parts.status);
+                info!("Backend {backend_name} response status: {}", parts.status);
 
                 // 流式转发后端响应体
                 Ok(Response::from_parts(
                     parts,
-                    body.map_err(|_| std::io::Error::other("error"))
-                        .boxed(),
+                    body.map_err(|_| std::io::Error::other("error")).boxed(),
                 ))
             }
             Err(_e) => Err(std::io::Error::other("error")),
