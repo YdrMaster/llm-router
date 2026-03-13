@@ -32,8 +32,8 @@ pub struct BackendConfig {
 /// 默认服务配置
 #[derive(Debug, Clone)]
 pub struct ServiceDefault {
-    pub retry: usize,
-    pub cooldown: Duration,
+    retry: usize,
+    cooldown: Duration,
 }
 
 const DEFAULT_RETRY: usize = 3;
@@ -305,15 +305,9 @@ fn resolve_alias_chain(
         path.push(current);
 
         match raw_router.get(current) {
-            Some(RouteTarget::Alias(next)) => {
-                current = &*next;
-            }
-            Some(RouteTarget::Backends(_)) => {
-                return Ok(current.into()); // 找到最终路由名
-            }
-            None => {
-                return Err(format!("Route '{current}' does not exist"));
-            }
+            Some(RouteTarget::Alias(next)) => current = next,
+            Some(RouteTarget::Backends(_)) => return Ok(current.into()), // 找到最终路由名
+            None => return Err(format!("Route '{current}' does not exist")),
         }
     }
 }

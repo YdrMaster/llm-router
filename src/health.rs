@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 /// 单个后端的健康跟踪
 pub struct BackendHealth {
-    pub is_healthy: AtomicBool,     // 是否在健康状态
-    pub failure_count: AtomicUsize, // 当前连续失败次数
-    pub cooldown_until: Mutex<Instant>,
+    is_healthy: AtomicBool,     // 是否在健康状态
+    failure_count: AtomicUsize, // 当前连续失败次数
+    cooldown_until: Mutex<Instant>,
 }
 
 impl BackendHealth {

@@ -8,15 +8,15 @@ pub use openai::OpenAiProtocol;
 
 /// 请求体解析结果
 pub struct ParsedRequest {
-    pub model: String,
+    pub(super) model: String,
 }
 
 /// 用于 models 列表响应的模型信息
 pub struct ModelInfo {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub owned_by: String,
+    pub(super) id: String,
+    pub(super) object: String,
+    pub(super) created: u64,
+    pub(super) owned_by: String,
 }
 
 /// 协议处理器 trait

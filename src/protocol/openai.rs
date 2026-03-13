@@ -11,11 +11,12 @@ impl OpenAiProtocol {
         let data: Vec<serde_json::Value> = models
             .iter()
             .map(|m| {
+                let ModelInfo { id, object, created, owned_by } = m;
                 serde_json::json!({
-                    "id": m.id,
-                    "object": m.object,
-                    "created": m.created,
-                    "owned_by": m.owned_by
+                    "id": id,
+                    "object": object,
+                    "created": created,
+                    "owned_by": owned_by
                 })
             })
             .collect();
