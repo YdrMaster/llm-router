@@ -1,6 +1,4 @@
-#![allow(dead_code)]
-
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,7 +43,9 @@ impl Server {
         let protocols: Vec<Arc<dyn Protocol>> =
             vec![Arc::new(OpenAiProtocol), Arc::new(AnthropicProtocol)];
 
-        let http_client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let http_client = Client::builder(hyper_util::rt::TokioExecutor::new())
+            .pool_max_idle_per_host(32)
+            .build_http();
 
         // 将 Config 转换为运行时数据结构
         let backends: HashMap<String, Backend> = config
@@ -95,7 +95,7 @@ impl Server {
         Some((backend_name.to_string(), backend))
     }
 
-    /// 修改请求体，如果配置了则替换 model 并添加 api-key
+    /// 修改请求体，如果配置了则替换 model
     fn modify_request_body(
         &self,
         body_bytes: Bytes,
@@ -108,49 +108,19 @@ impl Server {
             Err(_) => return body_bytes, // 如果解析失败，返回原始请求体
         };
 
-        // 如果后端配置了自定义 model，则替换
-        if let Some(ref backend_model) = backend.config.model {
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(backend_model.to_string()),
-                );
-            }
-        } else {
-            // 否则保留原始 model
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(original_model.to_string()),
-                );
-            }
+        // 替换 model 字段：优先使用后端配置的 model，否则使用原始 model
+        if let Some(obj) = json.as_object_mut() {
+            let model_to_use = backend.config.model.as_deref().unwrap_or(original_model);
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(model_to_use.to_string()),
+            );
         }
 
         // 序列化回字节
         match serde_json::to_vec(&json) {
             Ok(vec) => Bytes::from(vec),
             Err(_) => body_bytes,
-        }
-    }
-
-    pub async fn serve(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let port = self.backends.iter().next().map(|_| 8000).unwrap_or(8000);
-        let addr = SocketAddr::from(([0, 0, 0, 0], port as u16));
-        let listener = TcpListener::bind(addr).await?;
-        info!("Listening on http://{}", addr);
-
-        let server = Arc::new(self);
-
-        loop {
-            let (stream, remote_addr) = listener.accept().await?;
-            info!("Accepted connection from {}", remote_addr);
-
-            let server = Arc::clone(&server);
-            tokio::spawn(async move {
-                if let Err(e) = server.handle_connection(stream).await {
-                    warn!("Error handling connection from {}: {}", remote_addr, e);
-                }
-            });
         }
     }
 
@@ -201,7 +171,7 @@ impl Server {
                 .header(CONTENT_TYPE, "text/plain")
                 .body(
                     Full::from("Method not allowed")
-                        .map_err(|_| std::io::Error::other("error"))
+                        .map_err(std::io::Error::other)
                         .boxed(),
                 )
                 .unwrap());
@@ -224,7 +194,7 @@ impl Server {
                     .header(CONTENT_TYPE, "text/plain")
                     .body(
                         Full::from("Failed to read request body")
-                            .map_err(|_| std::io::Error::other("error"))
+                            .map_err(std::io::Error::other)
                             .boxed(),
                     )
                     .unwrap());
@@ -250,7 +220,7 @@ impl Server {
                             .header(CONTENT_TYPE, "text/plain")
                             .body(
                                 Full::from(format!("Invalid request: {e}"))
-                                    .map_err(|_| std::io::Error::other("error"))
+                                    .map_err(std::io::Error::other)
                                     .boxed(),
                             )
                             .unwrap());
@@ -266,7 +236,7 @@ impl Server {
                 .header(CONTENT_TYPE, "text/plain")
                 .body(
                     Full::from("No matching protocol")
-                        .map_err(|_| std::io::Error::other("error"))
+                        .map_err(std::io::Error::other)
                         .boxed(),
                 )
                 .unwrap());
@@ -285,10 +255,13 @@ impl Server {
         model_name: &str,
         original_auth_header: Option<String>,
     ) -> Result<Response<BoxBody>, std::io::Error> {
-        let mut tried_backends: Vec<String> = Vec::new();
+        let mut tried_backends: HashSet<String> = HashSet::new();
 
         // 解析模型名（处理别名）
-        let route_name = self.aliases.get(model_name).map_or(model_name, |v| v.as_ref());
+        let route_name = self
+            .aliases
+            .get(model_name)
+            .map_or(model_name, |v| v.as_ref());
         let backends_list = self.router.get(route_name);
 
         loop {
@@ -301,7 +274,7 @@ impl Server {
                 if let Some(backends) = backends_list {
                     for backend_name in backends.iter() {
                         let name = backend_name.as_ref();
-                        if !tried_backends.contains(&name.to_string())
+                        if !tried_backends.contains(name)
                             && let Some(backend) = self.backends.get(name)
                         {
                             next_backend = Some((name.to_string(), backend));
@@ -333,7 +306,7 @@ impl Server {
                 "Trying backend: {backend_name} (retry={}, cooldown={:?})",
                 backend.config.retry, backend.config.cooldown
             );
-            tried_backends.push(backend_name.clone());
+            tried_backends.insert(backend_name.clone());
 
             // 尝试带重试地转发请求
             match self
@@ -352,16 +325,7 @@ impl Server {
                     let status = response.status();
                     if status.is_server_error() {
                         warn!("Backend {backend_name} returned server error: {status}");
-
-                        // 记录失败并检查是否应进入冷却
-                        if backend.health.record_failure(backend.config.retry) {
-                            // 进入冷却
-                            backend.health.set_cooldown(backend.config.cooldown);
-                            warn!(
-                                "Backend {backend_name} entered cooldown for {:?}",
-                                backend.config.cooldown
-                            );
-                        }
+                        self.handle_backend_failure(backend, &backend_name);
                         // 继续循环尝试下一个后端
                         let _ = response;
                         continue;
@@ -374,20 +338,22 @@ impl Server {
                 Err(_) => {
                     // 重试后后端连接仍失败
                     warn!("Backend {backend_name} failed after retries");
-
-                    // 记录失败并检查是否应进入冷却
-                    if backend.health.record_failure(backend.config.retry) {
-                        // 进入冷却
-                        backend.health.set_cooldown(backend.config.cooldown);
-                        warn!(
-                            "Backend {backend_name} entered cooldown for {:?}",
-                            backend.config.cooldown
-                        );
-                    }
+                    self.handle_backend_failure(backend, &backend_name);
                     // 继续循环尝试下一个后端
                     continue;
                 }
             }
+        }
+    }
+
+    /// 处理后端失败：记录失败并检查是否应进入冷却
+    fn handle_backend_failure(&self, backend: &Backend, backend_name: &str) {
+        if backend.health.record_failure(backend.config.retry) {
+            backend.health.set_cooldown(backend.config.cooldown);
+            warn!(
+                "Backend {backend_name} entered cooldown for {:?}",
+                backend.config.cooldown
+            );
         }
     }
 
@@ -407,7 +373,7 @@ impl Server {
                     "Retry {}/{} for backend {backend_name}",
                     attempt + 1,
                     backend.config.retry,
-                );
+                )
             }
 
             match self
@@ -450,7 +416,7 @@ impl Server {
         backend_name: &str,
         original_auth_header: Option<String>,
     ) -> Result<Response<BoxBody>, std::io::Error> {
-        let url = format!("{}{}", backend.config.base_url, path);
+        let url = format!("{}{path}", backend.config.base_url);
 
         // 如果后端配置了自定义 model 或 api_key，则修改请求体
         let modified_body = self.modify_request_body(body_bytes, backend, original_model);
@@ -481,10 +447,13 @@ impl Server {
                 // 流式转发后端响应体
                 Ok(Response::from_parts(
                     parts,
-                    body.map_err(|_| std::io::Error::other("error")).boxed(),
+                    body.map_err(std::io::Error::other).boxed(),
                 ))
             }
-            Err(_e) => Err(std::io::Error::other("error")),
+            Err(e) => {
+                warn!("Failed to connect to backend {backend_name}: {e}");
+                Err(std::io::Error::other(e))
+            }
         }
     }
 
@@ -496,7 +465,7 @@ impl Server {
                 .header(CONTENT_TYPE, "text/plain")
                 .body(
                     Full::from("Models endpoint not found")
-                        .map_err(|_| std::io::Error::other("error"))
+                        .map_err(std::io::Error::other)
                         .boxed(),
                 )
                 .unwrap());
@@ -524,11 +493,7 @@ impl Server {
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
-            .body(
-                Full::from(body)
-                    .map_err(|_| std::io::Error::other("error"))
-                    .boxed(),
-            )
+            .body(Full::from(body).map_err(std::io::Error::other).boxed())
             .unwrap())
     }
 }
@@ -538,18 +503,18 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error + Sen
     let server = Server::new(config);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
-    info!("Listening on http://{}", addr);
+    info!("Listening on http://{addr}");
 
     let server = Arc::new(server);
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
-        info!("Accepted connection from {}", remote_addr);
+        info!("Accepted connection from {remote_addr}");
 
         let server = Arc::clone(&server);
         tokio::spawn(async move {
             if let Err(e) = server.handle_connection(stream).await {
-                warn!("Error handling connection from {}: {}", remote_addr, e);
+                warn!("Error handling connection from {remote_addr}: {e}");
             }
         });
     }

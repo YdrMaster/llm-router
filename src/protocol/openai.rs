@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use super::{ModelInfo, ParsedRequest, Protocol};
+use super::{parse_model_from_json, ModelInfo, ParsedRequest, Protocol};
 
 /// OpenAI 协议处理器
 pub struct OpenAiProtocol;
@@ -32,7 +32,7 @@ impl OpenAiProtocol {
 impl Protocol for OpenAiProtocol {
     fn matches(&self, path: &str, content_type: Option<&str>) -> bool {
         // OpenAI chat completions 端点
-        if path.contains("/chat/completions") {
+        if path.starts_with("/chat/completions") {
             return match content_type {
                 Some(ct) => ct.contains("application/json"),
                 None => false,
@@ -45,12 +45,81 @@ impl Protocol for OpenAiProtocol {
         &self,
         body: Bytes,
     ) -> Result<ParsedRequest, Box<dyn std::error::Error + Send + Sync>> {
-        let json: serde_json::Value = serde_json::from_slice(&body)?;
-        let model = json
-            .get("model")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'model' field in OpenAI request")?
-            .to_string();
+        let model = parse_model_from_json(body, "Missing 'model' field in OpenAI request")?;
         Ok(ParsedRequest { model })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matches_valid_path_and_content_type() {
+        let protocol = OpenAiProtocol;
+        assert!(protocol.matches("/chat/completions", Some("application/json")));
+        assert!(protocol.matches("/chat/completions/some-subpath", Some("application/json")));
+    }
+
+    #[test]
+    fn test_matches_wrong_path() {
+        let protocol = OpenAiProtocol;
+        assert!(!protocol.matches("/completions", Some("application/json")));
+        assert!(!protocol.matches("/messages", Some("application/json")));
+        assert!(!protocol.matches("/v1/messages", Some("application/json")));
+    }
+
+    #[test]
+    fn test_matches_missing_content_type() {
+        let protocol = OpenAiProtocol;
+        assert!(!protocol.matches("/chat/completions", None));
+    }
+
+    #[test]
+    fn test_matches_wrong_content_type() {
+        let protocol = OpenAiProtocol;
+        assert!(!protocol.matches("/chat/completions", Some("text/plain")));
+    }
+
+    #[test]
+    fn test_parse_valid_request() {
+        let protocol = OpenAiProtocol;
+        let body = Bytes::from(r#"{"model": "gpt-4", "messages": []}"#);
+        let result = protocol.parse(body).unwrap();
+        assert_eq!(result.model, "gpt-4");
+    }
+
+    #[test]
+    fn test_parse_missing_model() {
+        let protocol = OpenAiProtocol;
+        let body = Bytes::from(r#"{"messages": []}"#);
+        let result = protocol.parse(body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_models() {
+        let models = vec![
+            ModelInfo {
+                id: "model-1".to_string(),
+                object: "model".to_string(),
+                created: 1000,
+                owned_by: "org-1".to_string(),
+            },
+            ModelInfo {
+                id: "model-2".to_string(),
+                object: "model".to_string(),
+                created: 2000,
+                owned_by: "org-2".to_string(),
+            },
+        ];
+
+        let result = OpenAiProtocol::list_models(&models);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"].as_array().unwrap().len(), 2);
+        assert_eq!(json["data"][0]["id"], "model-1");
+        assert_eq!(json["data"][1]["id"], "model-2");
     }
 }

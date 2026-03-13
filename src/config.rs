@@ -82,17 +82,34 @@ fn parse_duration(s: &str) -> Option<Duration> {
     }
 }
 
-/// 扁平化可能因键中包含点号而嵌套的 TOML 表，
-/// 但保留看起来像后端详情结构的表。
+/// 扁平化可能因键中包含点号而嵌套的 TOML 表
 fn flatten_table(table: &toml::Table, prefix: &str) -> HashMap<String, Value> {
     let mut result = HashMap::new();
 
-    // 如果此表看起来像后端详情结构，不要扁平化
+    // 如果此表包含 "base-url"，说明这是一个后端详情结构，不要扁平化
+    // 而是将其作为一个完整的表返回
     if table.contains_key("base-url") {
         result.insert(prefix.to_string(), Value::Table(table.clone()));
         return result;
     }
 
+    // 检查此表是否只有简单的标量值（没有嵌套表）
+    let has_nested_table = table.values().any(|v| v.is_table());
+
+    if !has_nested_table {
+        // 简单表，直接扁平化
+        for (key, value) in table {
+            let full_key = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{}.{}", prefix, key)
+            };
+            result.insert(full_key, value.clone());
+        }
+        return result;
+    }
+
+    // 有嵌套表，需要递归
     for (key, value) in table {
         let full_key = if prefix.is_empty() {
             key.clone()
