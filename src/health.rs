@@ -42,14 +42,6 @@ impl BackendHealth {
         self.is_healthy.load(Ordering::Relaxed)
             || Instant::now() >= *self.cooldown_until.lock().unwrap()
     }
-
-    /// 获取剩余冷却时间（如果有）
-    pub fn remaining_cooldown(&self) -> Option<Duration> {
-        self.cooldown_until
-            .lock()
-            .unwrap()
-            .checked_duration_since(Instant::now())
-    }
 }
 
 impl Default for BackendHealth {

@@ -22,6 +22,9 @@ use crate::config::{BackendConfig, Config, RouteGroup};
 use crate::health::BackendHealth;
 use crate::protocol::{AnthropicProtocol, ModelInfo, OpenAiProtocol, Protocol};
 
+/// 通用响应体类型（用于非流式响应）
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
 #[derive(Clone)]
 struct Server {
     backends: Arc<HashMap<String, Backend>>,
@@ -73,10 +76,10 @@ impl Server {
         // 按顺序遍历后端，查找第一个健康的后端
         for backend_name in &route.backends {
             let name = backend_name.as_ref();
-            if let Some(backend) = self.backends.get(name) {
-                if backend.health.is_healthy() {
-                    return Some((name.to_string(), backend));
-                }
+            if let Some(backend) = self.backends.get(name)
+                && backend.health.is_healthy()
+            {
+                return Some((name.to_string(), backend));
             }
         }
 
@@ -168,7 +171,7 @@ impl Server {
     async fn handle_request(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<BoxBody>, std::io::Error> {
         // 记录请求信息
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -190,7 +193,11 @@ impl Server {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .header(CONTENT_TYPE, "text/plain")
-                .body(Full::from("Method not allowed"))
+                .body(
+                    Full::from("Method not allowed")
+                        .map_err(|_| std::io::Error::other("error"))
+                        .boxed(),
+                )
                 .unwrap());
         }
 
@@ -209,7 +216,11 @@ impl Server {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .header(CONTENT_TYPE, "text/plain")
-                    .body(Full::from("Failed to read request body"))
+                    .body(
+                        Full::from("Failed to read request body")
+                            .map_err(|_| std::io::Error::other("error"))
+                            .boxed(),
+                    )
                     .unwrap());
             }
         };
@@ -219,7 +230,7 @@ impl Server {
         let mut model_name = String::new();
         for protocol in &self.protocols {
             if protocol.matches(&path, content_type.as_deref()) {
-                match protocol.parse(Bytes::from(body_bytes.clone())) {
+                match protocol.parse(body_bytes.clone()) {
                     Ok(parsed) => {
                         info!("Matched protocol, model: {}", parsed.model);
                         model_name = parsed.model;
@@ -231,7 +242,13 @@ impl Server {
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .header(CONTENT_TYPE, "text/plain")
-                            .body(Full::from(format!("Invalid request: {}", e)))
+                            .body(
+                                Full::from(format!("Invalid request: {}", e))
+                                    .map_err(|_| {
+                                        std::io::Error::other("error")
+                                    })
+                                    .boxed(),
+                            )
                             .unwrap());
                     }
                 }
@@ -246,7 +263,11 @@ impl Server {
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header(CONTENT_TYPE, "text/plain")
-                .body(Full::from("No matching protocol"))
+                .body(
+                    Full::from("No matching protocol")
+                        .map_err(|_| std::io::Error::other("error"))
+                        .boxed(),
+                )
                 .unwrap());
         }
 
@@ -262,7 +283,7 @@ impl Server {
         body_bytes: Bytes,
         model_name: &str,
         original_auth_header: Option<String>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<BoxBody>, std::io::Error> {
         let mut tried_backends: Vec<String> = Vec::new();
 
         loop {
@@ -275,11 +296,11 @@ impl Server {
                 if let Some(route) = self.router.get(model_name) {
                     for backend_name in &route.backends {
                         let name = backend_name.as_ref();
-                        if !tried_backends.contains(&name.to_string()) {
-                            if let Some(backend) = self.backends.get(name) {
-                                next_backend = Some((name.to_string(), backend));
-                                break;
-                            }
+                        if !tried_backends.contains(&name.to_string())
+                            && let Some(backend) = self.backends.get(name)
+                        {
+                            next_backend = Some((name.to_string(), backend));
+                            break;
                         }
                     }
                 }
@@ -294,7 +315,13 @@ impl Server {
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
                         .header(CONTENT_TYPE, "text/plain")
-                        .body(Full::from("All backends unavailable"))
+                        .body(
+                            Full::from("All backends unavailable")
+                                .map_err(|_| {
+                                    std::io::Error::other("error")
+                                })
+                                .boxed(),
+                        )
                         .unwrap());
                 }
             };
@@ -319,12 +346,9 @@ impl Server {
             {
                 Ok(response) => {
                     // 检查响应是否表示错误（5xx 状态）
-                    if response.status().is_server_error() {
-                        warn!(
-                            "Backend {} returned server error: {}",
-                            backend_name,
-                            response.status()
-                        );
+                    let status = response.status();
+                    if status.is_server_error() {
+                        warn!("Backend {} returned server error: {}", backend_name, status);
 
                         // 记录失败并检查是否应进入冷却
                         if backend.health.record_failure(backend.config.retry) {
@@ -336,6 +360,7 @@ impl Server {
                             );
                         }
                         // 继续循环尝试下一个后端
+                        let _ = response;
                         continue;
                     } else {
                         // 成功 - 记录并返回
@@ -372,7 +397,7 @@ impl Server {
         backend: &Backend,
         original_model: &str,
         original_auth_header: Option<String>,
-    ) -> Result<Response<Full<Bytes>>, ()> {
+    ) -> Result<Response<BoxBody>, std::io::Error> {
         for attempt in 0..backend.config.retry {
             if attempt > 0 {
                 info!(
@@ -413,7 +438,7 @@ impl Server {
             "Backend {} failed after {} attempts",
             backend_name, backend.config.retry
         );
-        Err(())
+        Err(std::io::Error::other("error"))
     }
 
     async fn forward_request(
@@ -424,7 +449,7 @@ impl Server {
         original_model: &str,
         backend_name: &str,
         original_auth_header: Option<String>,
-    ) -> Result<Response<Full<Bytes>>, String> {
+    ) -> Result<Response<BoxBody>, std::io::Error> {
         let url = format!("{}{}", backend.config.base_url, path);
 
         // 如果后端配置了自定义 model 或 api_key，则修改请求体
@@ -451,37 +476,30 @@ impl Server {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
 
-                // 收集后端响应体
-                let backend_body = match body.collect().await {
-                    Ok(b) => b.to_bytes(),
-                    Err(e) => {
-                        return Err(format!("Failed to collect backend response: {}", e));
-                    }
-                };
-
                 info!("Backend {} response status: {}", backend_name, parts.status);
 
-                // 返回后端响应
-                Ok(Response::builder()
-                    .status(parts.status)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Full::from(backend_body))
-                    .unwrap())
+                // 流式转发后端响应体
+                Ok(Response::from_parts(
+                    parts,
+                    body.map_err(|_| std::io::Error::other("error"))
+                        .boxed(),
+                ))
             }
-            Err(e) => Err(format!(
-                "Failed to forward to backend {}: {}",
-                backend_name, e
-            )),
+            Err(_e) => Err(std::io::Error::other("error")),
         }
     }
 
-    fn handle_models_list(&self, path: &str) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    fn handle_models_list(&self, path: &str) -> Result<Response<BoxBody>, std::io::Error> {
         // 仅支持 OpenAI 风格的 /v1/models 端点
         if path != "/v1/models" {
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header(CONTENT_TYPE, "text/plain")
-                .body(Full::from("Models endpoint not found"))
+                .body(
+                    Full::from("Models endpoint not found")
+                        .map_err(|_| std::io::Error::other("error"))
+                        .boxed(),
+                )
                 .unwrap());
         }
 
@@ -507,7 +525,11 @@ impl Server {
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
-            .body(Full::from(body))
+            .body(
+                Full::from(body)
+                    .map_err(|_| std::io::Error::other("error"))
+                    .boxed(),
+            )
             .unwrap())
     }
 }
