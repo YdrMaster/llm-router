@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +17,7 @@ use hyper_util::rt::TokioIo;
 use log::{info, warn};
 use tokio::net::TcpListener;
 
-use crate::config::{BackendConfig, Config, LoadBalancerConfig, LoadBalanceStrategy};
+use crate::config::{BackendConfig, Config, LoadBalancerConfig};
 use crate::health::BackendHealth;
 use crate::protocol::{AnthropicProtocol, ModelInfo, OpenAiProtocol, Protocol};
 
@@ -101,23 +100,15 @@ impl Server {
     fn select_from_load_balancer(&self, lb_name: &str) -> Option<String> {
         let lb = self.load_balancers.get(lb_name)?;
         
-        let index = match lb.strategy {
-            LoadBalanceStrategy::Shuffle => {
-                // 随机选择
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let seed = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as usize;
-                seed % lb.backends.len()
-            }
-            LoadBalanceStrategy::RoundRobin => {
-                // 轮询
-                lb.counter.fetch_add(1, Ordering::Relaxed) % lb.backends.len()
-            }
-        };
-
-        lb.backends.get(index).map(|s| s.as_ref().to_string())
+        // 生成随机种子（对于 Shuffle 策略）
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as usize;
+        
+        let index = lb.select_index(seed);
+        lb.get_backend(index).map(|s| s.to_string())
     }
 
     /// 查找给定模型名称的第一个健康后端

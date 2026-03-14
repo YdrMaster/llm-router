@@ -131,4 +131,74 @@ mod tests {
         assert_eq!(json["data"][0]["id"], "model-1");
         assert_eq!(json["data"][1]["id"], "model-2");
     }
+
+    #[test]
+    fn test_list_models_empty() {
+        let models: Vec<ModelInfo> = vec![];
+        let result = OpenAiProtocol::list_models(&models);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_matches_path_variations() {
+        let protocol = OpenAiProtocol;
+        
+        // 有效路径 - 必须精确匹配 /chat/completions 开头
+        assert!(protocol.matches("/chat/completions", Some("application/json")));
+        
+        // 无效路径 - 不同的端点
+        assert!(!protocol.matches("/v1/chat/completions", Some("application/json"))); // 实际代码检查 starts_with("/chat/completions")
+        assert!(!protocol.matches("/api/chat/completions", Some("application/json")));
+        assert!(!protocol.matches("/completions", Some("application/json")));
+    }
+
+    #[test]
+    fn test_matches_content_type_variations() {
+        let protocol = OpenAiProtocol;
+        
+        // 有效 content-type
+        assert!(protocol.matches("/chat/completions", Some("application/json")));
+        assert!(protocol.matches("/chat/completions", Some("application/json; charset=utf-8")));
+        
+        // 无效 content-type - 注意：实际代码对大小写敏感
+        assert!(!protocol.matches("/chat/completions", Some("text/plain")));
+        assert!(!protocol.matches("/chat/completions", Some("application/xml")));
+        assert!(!protocol.matches("/chat/completions", Some("text/html")));
+        assert!(!protocol.matches("/chat/completions", Some("APPLICATION/JSON"))); // 大小写敏感
+    }
+
+    #[test]
+    fn test_parse_with_extra_fields() {
+        let protocol = OpenAiProtocol;
+        let body = Bytes::from(r#"{"model": "gpt-4", "messages": [], "temperature": 0.7, "stream": true}"#);
+        let result = protocol.parse(body).unwrap();
+        assert_eq!(result.model, "gpt-4");
+    }
+
+    #[test]
+    fn test_parse_model_with_special_chars() {
+        let protocol = OpenAiProtocol;
+        let body = Bytes::from(r#"{"model": "gpt-4-turbo-preview", "messages": []}"#);
+        let result = protocol.parse(body).unwrap();
+        assert_eq!(result.model, "gpt-4-turbo-preview");
+    }
+
+    #[test]
+    fn test_parse_invalid_json() {
+        let protocol = OpenAiProtocol;
+        let body = Bytes::from("not valid json");
+        let result = protocol.parse(body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_body() {
+        let protocol = OpenAiProtocol;
+        let body = Bytes::from("{}");
+        let result = protocol.parse(body);
+        assert!(result.is_err());
+    }
 }
