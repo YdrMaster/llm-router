@@ -1,6 +1,6 @@
 ﻿[service]
 port = 8000         # 路由监听的端口
-log_level = "trace" # trace | debug | *info | warn | error | off
+log_level = "info"  # trace | debug | *info | warn | error | off
 
 [service.default]
 retry = 2
@@ -9,6 +9,7 @@ cooldown = "3min"
 [backend]
 sglang-qwen3.5-35b-A3b = "http://172.17.250.163:30001"
 sglang-qwen3.5-122b-a10b = "http://172.17.250.163:30000"
+vllm-qwen3.5-122b-a10b = "http://172.17.250.164:30000"
 
 [backend.aliyun]
 base-url = "https://dashscope.aliyuncs.com/apps/anthropic"
@@ -16,9 +17,15 @@ api-key = "$ALIYUN_API_KEY"
 retry = 5
 cooldown = "30s"
 
+# 负载均衡池配置
+[load-balance.qwen3.5-load-balance]
+backends = ["sglang-qwen3.5-122b-a10b", "vllm-qwen3.5-122b-a10b"]
+strategy = "shuffle"  # shuffle (随机) | round_robin (轮询)
+
 [router]
 "data/Qwen3.5-35B-A3B" = "qwen3.5-35b-a3b"
 Qwen3.5-35B-A3B = "qwen3.5-35b-a3b"
 Qwen3.5-122B-A10B = "qwen3.5-122b-a10b"
 qwen3.5-35b-a3b = ["sglang-qwen3.5-35b-a3b", "aliyun"]
-qwen3.5-122b-a10b = ["sglang-qwen3.5-122b-a10b", "aliyun"]
+# 路由可以使用负载均衡池
+qwen3.5-122b-a10b = ["qwen3.5-load-balance", "aliyun"]

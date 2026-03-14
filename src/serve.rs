@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +18,7 @@ use hyper_util::rt::TokioIo;
 use log::{info, warn};
 use tokio::net::TcpListener;
 
-use crate::config::{BackendConfig, Config};
+use crate::config::{BackendConfig, Config, LoadBalancerConfig, LoadBalanceStrategy};
 use crate::health::BackendHealth;
 use crate::protocol::{AnthropicProtocol, ModelInfo, OpenAiProtocol, Protocol};
 
@@ -37,6 +38,7 @@ struct ForwardRequestParams {
 #[derive(Clone)]
 struct Server {
     backends: Arc<HashMap<String, Backend>>,
+    load_balancers: Arc<HashMap<String, LoadBalancerConfig>>,
     aliases: Arc<HashMap<String, Box<str>>>,
     router: Arc<HashMap<String, Box<[Box<str>]>>>,
     protocols: Vec<Arc<dyn Protocol>>,
@@ -87,11 +89,35 @@ impl Server {
 
         Server {
             backends: Arc::new(backends),
+            load_balancers: Arc::new(config.load_balancer),
             aliases: Arc::new(config.aliases),
             router: Arc::new(config.router),
             protocols,
             http_client,
         }
+    }
+
+    /// 从负载均衡池中选择一个后端
+    fn select_from_load_balancer(&self, lb_name: &str) -> Option<String> {
+        let lb = self.load_balancers.get(lb_name)?;
+        
+        let index = match lb.strategy {
+            LoadBalanceStrategy::Shuffle => {
+                // 随机选择
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as usize;
+                seed % lb.backends.len()
+            }
+            LoadBalanceStrategy::RoundRobin => {
+                // 轮询
+                lb.counter.fetch_add(1, Ordering::Relaxed) % lb.backends.len()
+            }
+        };
+
+        lb.backends.get(index).map(|s| s.as_ref().to_string())
     }
 
     /// 查找给定模型名称的第一个健康后端
@@ -105,17 +131,34 @@ impl Server {
         // 按顺序遍历后端，查找第一个健康的后端
         for backend_name in backends.iter() {
             let name = backend_name.as_ref();
-            if let Some(backend) = self.backends.get(name)
+            
+            // 检查是否是负载均衡池
+            let actual_backend_name = if self.load_balancers.contains_key(name) {
+                // 从负载均衡池中选择一个后端
+                self.select_from_load_balancer(name)?
+            } else {
+                name.to_string()
+            };
+            
+            if let Some(backend) = self.backends.get(&actual_backend_name)
                 && backend.health.is_healthy()
             {
-                return Some((name.to_string(), backend));
+                return Some((actual_backend_name, backend));
             }
         }
 
         // 所有后端都不健康，仍然返回第一个（可能会失败）
-        let backend_name = backends.first()?.as_ref();
-        let backend = self.backends.get(backend_name)?;
-        Some((backend_name.to_string(), backend))
+        let first_name = backends.first()?.as_ref();
+        
+        // 检查第一个是否是负载均衡池
+        let actual_first = if self.load_balancers.contains_key(first_name) {
+            self.select_from_load_balancer(first_name)?
+        } else {
+            first_name.to_string()
+        };
+        
+        let backend = self.backends.get(&actual_first)?;
+        Some((actual_first, backend))
     }
 
     /// 修改请求体，如果配置了则替换 model
@@ -301,10 +344,21 @@ impl Server {
                 if let Some(backends) = backends_list {
                     for backend_name in backends.iter() {
                         let name = backend_name.as_ref();
-                        if !tried_backends.contains(name)
-                            && let Some(backend) = self.backends.get(name)
+                        
+                        // 检查是否是负载均衡池
+                        let actual_name = if self.load_balancers.contains_key(name) {
+                            // 从负载均衡池中选择一个后端
+                            self.select_from_load_balancer(name).ok_or_else(|| {
+                                std::io::Error::other(format!("Load balancer '{}' returned no backend", name))
+                            })?
+                        } else {
+                            name.to_string()
+                        };
+                        
+                        if !tried_backends.contains(&actual_name)
+                            && let Some(backend) = self.backends.get(&actual_name)
                         {
-                            next_backend = Some((name.to_string(), backend));
+                            next_backend = Some((actual_name, backend));
                             break;
                         }
                     }

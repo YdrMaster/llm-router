@@ -2,6 +2,8 @@ use log::{LevelFilter, warn};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::Duration;
 use toml::Value;
 
@@ -9,6 +11,7 @@ use toml::Value;
 pub struct Config {
     pub service: ServiceConfig,
     pub backend: HashMap<String, BackendConfig>,
+    pub load_balancer: HashMap<String, LoadBalancerConfig>,
     pub aliases: HashMap<String, Box<str>>,
     pub router: HashMap<String, Box<[Box<str>]>>,
     _default: ServiceDefault,
@@ -27,6 +30,35 @@ pub struct BackendConfig {
     pub model: Option<Box<str>>,
     pub retry: usize,
     pub cooldown: Duration,
+}
+
+/// 负载均衡策略
+#[derive(Debug, Clone, Default)]
+pub enum LoadBalanceStrategy {
+    /// 随机选择（shuffle）
+    #[default]
+    Shuffle,
+    /// 轮询（round_robin）
+    RoundRobin,
+}
+
+/// 负载均衡器配置
+#[derive(Debug)]
+pub struct LoadBalancerConfig {
+    pub strategy: LoadBalanceStrategy,
+    pub backends: Box<[Box<str>]>,
+    /// 轮询计数器（用于 RoundRobin）
+    pub counter: Arc<AtomicUsize>,
+}
+
+impl Clone for LoadBalancerConfig {
+    fn clone(&self) -> Self {
+        LoadBalancerConfig {
+            strategy: self.strategy.clone(),
+            backends: self.backends.clone(),
+            counter: self.counter.clone(),
+        }
+    }
 }
 
 /// 默认服务配置
@@ -238,6 +270,53 @@ impl Config {
             }
         }
 
+        // 解析 load-balance 部分（可选）
+        let mut load_balancer = HashMap::new();
+        if let Some(lb_value) = value.get("load-balance") {
+            let lb_table = lb_value.as_table().ok_or("[load-balance] must be a table")?;
+
+            for (key, val) in lb_table {
+                if let Some(table) = val.as_table() {
+                    // 解析 backends 数组（必需）
+                    let backends = table
+                        .get("backends")
+                        .and_then(Value::as_array)
+                        .ok_or("Missing or invalid 'backends' in load-balance config")?;
+                    
+                    let backends: Box<[Box<str>]> = backends
+                        .iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(|s| s.into())
+                                .ok_or("backends array values must be strings")
+                        })
+                        .collect::<Result<_, _>>()?;
+
+                    // 解析 strategy（可选，默认为 shuffle）
+                    let strategy = table
+                        .get("strategy")
+                        .and_then(Value::as_str)
+                        .map(|s| match s.to_lowercase().as_str() {
+                            "round_robin" | "round-robin" => LoadBalanceStrategy::RoundRobin,
+                            "shuffle" | "random" => LoadBalanceStrategy::Shuffle,
+                            _ => LoadBalanceStrategy::Shuffle,
+                        })
+                        .unwrap_or_default();
+
+                    load_balancer.insert(
+                        key.clone(),
+                        LoadBalancerConfig {
+                            strategy,
+                            backends,
+                            counter: Arc::new(AtomicUsize::new(0)),
+                        },
+                    );
+                } else {
+                    return Err("Invalid load-balance value format, must be a table".into());
+                }
+            }
+        }
+
         // 解析 router 部分（可选）
         // 阶段 1: 解析原始路由条目到临时结构
         let mut raw_router: HashMap<String, RouteTarget> = HashMap::new();
@@ -290,6 +369,7 @@ impl Config {
         Ok(Config {
             service: ServiceConfig { port, log_level },
             backend,
+            load_balancer,
             aliases,
             router,
             _default: default,
@@ -717,5 +797,68 @@ model2 = ["model2-local", "aliyun"]
         assert_eq!(backends.len(), 2);
         assert_eq!(backends[0].as_ref(), "model1-local");
         assert_eq!(backends[1].as_ref(), "aliyun");
+    }
+
+    /// 测试负载均衡配置
+    #[test]
+    fn test_load_balancer_config() {
+        let content = r#"
+[service]
+port = 8000
+
+[backend]
+backend1 = "http://1.2.3.4:30000"
+backend2 = "http://1.2.3.4:30001"
+backend3 = "http://1.2.3.4:30002"
+
+[load-balance.pool1]
+backends = ["backend1", "backend2"]
+strategy = "shuffle"
+
+[load-balance.pool2]
+backends = ["backend1", "backend2", "backend3"]
+strategy = "round_robin"
+
+[router]
+model-a = ["pool1", "backend3"]
+"#;
+        let config = Config::from_str(content).unwrap();
+
+        assert_eq!(config.load_balancer.len(), 2);
+
+        let pool1 = config.load_balancer.get("pool1").unwrap();
+        assert_eq!(pool1.backends.len(), 2);
+        assert_eq!(pool1.backends[0].as_ref(), "backend1");
+        assert_eq!(pool1.backends[1].as_ref(), "backend2");
+        assert!(matches!(pool1.strategy, LoadBalanceStrategy::Shuffle));
+
+        let pool2 = config.load_balancer.get("pool2").unwrap();
+        assert_eq!(pool2.backends.len(), 3);
+        assert!(matches!(pool2.strategy, LoadBalanceStrategy::RoundRobin));
+
+        assert_eq!(config.router.len(), 1);
+        let model_a = config.router.get("model-a").unwrap();
+        assert_eq!(model_a.len(), 2);
+        assert_eq!(model_a[0].as_ref(), "pool1");
+        assert_eq!(model_a[1].as_ref(), "backend3");
+    }
+
+    /// 测试负载均衡配置默认策略
+    #[test]
+    fn test_load_balancer_default_strategy() {
+        let content = r#"
+[service]
+port = 8000
+
+[backend]
+backend1 = "http://1.2.3.4:30000"
+
+[load-balance.pool1]
+backends = ["backend1"]
+"#;
+        let config = Config::from_str(content).unwrap();
+
+        let pool1 = config.load_balancer.get("pool1").unwrap();
+        assert!(matches!(pool1.strategy, LoadBalanceStrategy::Shuffle));
     }
 }
