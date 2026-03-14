@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use super::{parse_model_from_json, ModelInfo, ParsedRequest, Protocol};
+use super::{ModelInfo, ParsedRequest, Protocol, parse_model_from_json};
 
 /// OpenAI 协议处理器
 pub struct OpenAiProtocol;
@@ -11,7 +11,12 @@ impl OpenAiProtocol {
         let data: Vec<serde_json::Value> = models
             .iter()
             .map(|m| {
-                let ModelInfo { id, object, created, owned_by } = m;
+                let ModelInfo {
+                    id,
+                    object,
+                    created,
+                    owned_by,
+                } = m;
                 serde_json::json!({
                     "id": id,
                     "object": object,
@@ -47,6 +52,10 @@ impl Protocol for OpenAiProtocol {
     ) -> Result<ParsedRequest, Box<dyn std::error::Error + Send + Sync>> {
         let model = parse_model_from_json(body, "Missing 'model' field in OpenAI request")?;
         Ok(ParsedRequest { model })
+    }
+
+    fn using_x_api_key(&self) -> bool {
+        false
     }
 }
 

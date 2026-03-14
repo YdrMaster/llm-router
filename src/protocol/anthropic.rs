@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use super::{parse_model_from_json, ParsedRequest, Protocol};
+use super::{ParsedRequest, Protocol, parse_model_from_json};
 
 /// Anthropic 协议处理器
 pub struct AnthropicProtocol;
@@ -23,6 +23,10 @@ impl Protocol for AnthropicProtocol {
     ) -> Result<ParsedRequest, Box<dyn std::error::Error + Send + Sync>> {
         let model = parse_model_from_json(body, "Missing 'model' field in Anthropic request")?;
         Ok(ParsedRequest { model })
+    }
+
+    fn using_x_api_key(&self) -> bool {
+        true
     }
 }
 

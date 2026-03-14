@@ -41,6 +41,8 @@ pub trait Protocol: Send + Sync {
     /// 解析请求体并提取 model 字段
     fn parse(&self, body: Bytes)
     -> Result<ParsedRequest, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn using_x_api_key(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -77,7 +79,7 @@ mod tests {
             created: 1234567890,
             owned_by: "test-org".to_string(),
         };
-        
+
         // 确保可以序列化
         let json = serde_json::json!({
             "id": info.id,
@@ -85,7 +87,7 @@ mod tests {
             "created": info.created,
             "owned_by": info.owned_by
         });
-        
+
         assert_eq!(json["id"], "test-model");
         assert_eq!(json["object"], "model");
         assert_eq!(json["created"], 1234567890);

@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::CONTENT_TYPE;
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioIo;
@@ -23,13 +24,23 @@ use crate::protocol::{AnthropicProtocol, ModelInfo, OpenAiProtocol, Protocol};
 /// 通用响应体类型（用于非流式响应）
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
+/// 转发请求的参数封装
+struct ForwardRequestParams {
+    path: String,
+    body_bytes: Bytes,
+    backend_name: String,
+    original_model: String,
+    original_headers: HashMap<String, Box<[u8]>>,
+    using_x_api_key: bool,
+}
+
 #[derive(Clone)]
 struct Server {
     backends: Arc<HashMap<String, Backend>>,
     aliases: Arc<HashMap<String, Box<str>>>,
     router: Arc<HashMap<String, Box<[Box<str>]>>>,
     protocols: Vec<Arc<dyn Protocol>>,
-    http_client: Client<HttpConnector, Full<Bytes>>,
+    http_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
 }
 
 /// 运行时后端，包含配置和健康状态
@@ -43,9 +54,21 @@ impl Server {
         let protocols: Vec<Arc<dyn Protocol>> =
             vec![Arc::new(OpenAiProtocol), Arc::new(AnthropicProtocol)];
 
+        // 创建支持 HTTP 和 HTTPS 的连接器
+        let mut http_connector = HttpConnector::new();
+        http_connector.set_nodelay(true);
+        http_connector.enforce_http(false);
+
+        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .unwrap()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http_connector);
+
         let http_client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .pool_max_idle_per_host(32)
-            .build_http();
+            .build(https_connector);
 
         // 将 Config 转换为运行时数据结构
         let backends: HashMap<String, Backend> = config
@@ -177,13 +200,17 @@ impl Server {
                 .unwrap());
         }
 
-        // 收集请求体
-        // 先提取原始请求的 Authorization 头（用于后端未配置 api_key 时转发）
-        let original_auth_header = req
+        // 收集所有请求头
+        let original_headers: HashMap<String, Box<[u8]>> = req
             .headers()
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .iter()
+            .map(|(name, value)| (name.as_str().to_lowercase(), value))
+            .filter(|(name, _)| {
+                let name = name.as_str();
+                name != "host" && name != CONTENT_TYPE && name != CONTENT_LENGTH
+            })
+            .map(|(name, value)| (name, value.as_bytes().into()))
+            .collect();
 
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -202,34 +229,11 @@ impl Server {
         };
 
         // 尝试匹配并解析每个协议
-        let mut matched = false;
-        let mut model_name = String::new();
-        for protocol in &self.protocols {
-            if protocol.matches(&path, content_type.as_deref()) {
-                match protocol.parse(body_bytes.clone()) {
-                    Ok(parsed) => {
-                        info!("Matched protocol, model: {}", parsed.model);
-                        model_name = parsed.model;
-                        matched = true;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse request: {e}");
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(
-                                Full::from(format!("Invalid request: {e}"))
-                                    .map_err(std::io::Error::other)
-                                    .boxed(),
-                            )
-                            .unwrap());
-                    }
-                }
-            }
-        }
-
-        if !matched {
+        let Some(protocol) = self
+            .protocols
+            .iter()
+            .find(|p| p.matches(&path, content_type.as_deref()))
+        else {
             warn!("No matching protocol for path: {path}, content-type: {content_type:?}");
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -240,11 +244,34 @@ impl Server {
                         .boxed(),
                 )
                 .unwrap());
-        }
+        };
 
-        // 查找此模型的后端并尝试故障转移
-        self.handle_with_failover(path, body_bytes, &model_name, original_auth_header)
-            .await
+        match protocol.parse(body_bytes.clone()) {
+            Ok(parsed) => {
+                info!("Matched protocol, model: {}", parsed.model);
+                // 查找此模型的后端并尝试故障转移
+                self.handle_with_failover(
+                    path,
+                    body_bytes,
+                    &parsed.model,
+                    original_headers,
+                    protocol.using_x_api_key(),
+                )
+                .await
+            }
+            Err(e) => {
+                warn!("Failed to parse request: {e}");
+                Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(
+                        Full::from(format!("Invalid request: {e}"))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                    )
+                    .unwrap())
+            }
+        }
     }
 
     /// 处理带重试和后端故障转移的请求
@@ -252,17 +279,17 @@ impl Server {
         &self,
         path: String,
         body_bytes: Bytes,
-        model_name: &str,
-        original_auth_header: Option<String>,
+        mut model_name: &str,
+        original_headers: HashMap<String, Box<[u8]>>,
+        using_x_api_key: bool,
     ) -> Result<Response<BoxBody>, std::io::Error> {
         let mut tried_backends: HashSet<String> = HashSet::new();
 
         // 解析模型名（处理别名）
-        let route_name = self
-            .aliases
-            .get(model_name)
-            .map_or(model_name, |v| v.as_ref());
-        let backends_list = self.router.get(route_name);
+        if let Some(alias) = self.aliases.get(model_name) {
+            model_name = alias;
+        };
+        let backends_list = self.router.get(model_name);
 
         loop {
             // 查找下一个要尝试的后端
@@ -309,17 +336,16 @@ impl Server {
             tried_backends.insert(backend_name.clone());
 
             // 尝试带重试地转发请求
-            match self
-                .forward_with_retry(
-                    path.clone(),
-                    body_bytes.clone(),
-                    &backend_name,
-                    backend,
-                    model_name,
-                    original_auth_header.clone(),
-                )
-                .await
-            {
+            let params = ForwardRequestParams {
+                path: path.clone(),
+                body_bytes: body_bytes.clone(),
+                backend_name: backend_name.clone(),
+                original_model: model_name.to_string(),
+                original_headers: original_headers.clone(),
+                using_x_api_key,
+            };
+
+            match self.forward_with_retry(&params, backend).await {
                 Ok(response) => {
                     // 检查响应是否表示错误（5xx 状态）
                     let status = response.status();
@@ -360,40 +386,28 @@ impl Server {
     /// 带重试逻辑的转发请求
     async fn forward_with_retry(
         &self,
-        path: String,
-        body_bytes: Bytes,
-        backend_name: &str,
+        params: &ForwardRequestParams,
         backend: &Backend,
-        original_model: &str,
-        original_auth_header: Option<String>,
     ) -> Result<Response<BoxBody>, std::io::Error> {
         for attempt in 0..backend.config.retry {
             if attempt > 0 {
                 info!(
-                    "Retry {}/{} for backend {backend_name}",
+                    "Retry {}/{} for backend {}",
                     attempt + 1,
                     backend.config.retry,
+                    params.backend_name,
                 )
             }
 
-            match self
-                .forward_request(
-                    path.clone(),
-                    body_bytes.clone(),
-                    backend,
-                    original_model,
-                    backend_name,
-                    original_auth_header.clone(),
-                )
-                .await
-            {
+            match self.forward_request(params, backend).await {
                 Ok(response) => {
                     return Ok(response);
                 }
                 Err(e) => {
                     warn!(
-                        "Attempt {} failed for backend {backend_name}: {e}",
+                        "Attempt {} failed for backend {}: {e}",
                         attempt + 1,
+                        params.backend_name,
                     );
                     // 继续下一次重试
                 }
@@ -401,7 +415,8 @@ impl Server {
         }
 
         warn!(
-            "Backend {backend_name} failed after {} attempts",
+            "Backend {} failed after {} attempts",
+            params.backend_name,
             backend.config.retry
         );
         Err(std::io::Error::other("error"))
@@ -409,17 +424,17 @@ impl Server {
 
     async fn forward_request(
         &self,
-        path: String,
-        body_bytes: Bytes,
+        params: &ForwardRequestParams,
         backend: &Backend,
-        original_model: &str,
-        backend_name: &str,
-        original_auth_header: Option<String>,
     ) -> Result<Response<BoxBody>, std::io::Error> {
-        let url = format!("{}{path}", backend.config.base_url);
+        let url = format!("{}{}", backend.config.base_url, params.path);
 
-        // 如果后端配置了自定义 model 或 api_key，则修改请求体
-        let modified_body = self.modify_request_body(body_bytes, backend, original_model);
+        // 如果后端配置了自定义 model，则修改请求体
+        let modified_body = self.modify_request_body(
+            params.body_bytes.clone(),
+            backend,
+            &params.original_model,
+        );
 
         // 构建转发请求
         let mut req_builder = Request::builder()
@@ -427,12 +442,26 @@ impl Server {
             .uri(&url)
             .header(CONTENT_TYPE, "application/json");
 
-        // 如果后端配置了 api_key，使用配置的 api_key
-        // 否则，如果原请求带有 Authorization 头，则保留
-        if let Some(ref api_key) = backend.config.api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-        } else if let Some(auth_header) = original_auth_header {
-            req_builder = req_builder.header("Authorization", auth_header);
+        let mut original_headers = params.original_headers.clone();
+        let mut using_x_api_key = params.using_x_api_key;
+
+        if let Some(api_key) = backend.config.api_key.as_deref() {
+            if original_headers.remove("x-api-key").is_some() {
+                using_x_api_key = true
+            } else if original_headers.remove(AUTHORIZATION.as_str()).is_some() {
+                using_x_api_key = false
+            }
+
+            if using_x_api_key {
+                req_builder = req_builder.header("x-api-key", api_key)
+            } else {
+                req_builder = req_builder.header(AUTHORIZATION, format!("Bearer {api_key}"))
+            }
+        }
+
+        // 转发所有原始 headers
+        for (name, value) in original_headers {
+            req_builder = req_builder.header(&*name, &*value)
         }
 
         let forward_req = req_builder.body(Full::from(modified_body)).unwrap();
@@ -442,7 +471,11 @@ impl Server {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
 
-                info!("Backend {backend_name} response status: {}", parts.status);
+                info!(
+                    "Backend {} response status: {}",
+                    params.backend_name,
+                    parts.status
+                );
 
                 // 流式转发后端响应体
                 Ok(Response::from_parts(
@@ -451,7 +484,10 @@ impl Server {
                 ))
             }
             Err(e) => {
-                warn!("Failed to connect to backend {backend_name}: {e}");
+                warn!(
+                    "Failed to connect to backend {}: {e}",
+                    params.backend_name
+                );
                 Err(std::io::Error::other(e))
             }
         }
