@@ -286,7 +286,7 @@ impl Server {
         match protocol.parse(body_bytes.clone()) {
             Ok(parsed) => {
                 info!("Matched protocol, model: {}", parsed.model);
-                
+
                 // 创建请求上下文
                 let context = RequestContext::new(parsed.model.clone(), path.clone());
 
@@ -319,11 +319,7 @@ impl Server {
                         body_bytes = intercepted_req.into_body();
                     }
                 }
-                
-                // 重新构建 body_bytes 用于后续处理
-                // 注意：intercept_request 可以修改 intercepted_req 的 body
-                // 但这里我们简单处理，继续使用原始 body_bytes
-                
+
                 // 查找此模型的后端并尝试故障转移
                 self.handle_with_failover(
                     path,
@@ -577,10 +573,10 @@ impl Server {
                 match self.middleware.intercept_response(&mut intercepted_resp, &context) {
                     InterceptAction::Block(boxed_body) => {
                         // 中间件阻止了响应，返回新响应
-                        return Ok(Response::builder()
+                        Ok(Response::builder()
                             .status(StatusCode::OK)
                             .body(boxed_body)
-                            .unwrap());
+                            .unwrap())
                     }
                     InterceptAction::Continue => {
                         // 使用可能被修改的响应
@@ -588,7 +584,7 @@ impl Server {
                         let boxed_body = Full::from(bytes_body)
                             .map_err(std::io::Error::other)
                             .boxed();
-                        return Ok(Response::from_parts(parts, boxed_body));
+                        Ok(Response::from_parts(parts, boxed_body))
                     }
                 }
             }

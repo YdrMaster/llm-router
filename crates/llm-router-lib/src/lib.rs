@@ -4,10 +4,10 @@
 //!
 //! # 模块结构
 //!
-//! - [`config`]: 配置定义和解析
-//! - [`health`]: 后端健康检查
-//! - [`protocol`]: 协议解析（OpenAI、Anthropic 等）
-//! - [`middleware`]: 中间件拦截器 trait
+//! - [`config`][]: 配置定义和解析
+//! - [`health`][]: 后端健康检查
+//! - [`protocol`][]: 协议解析（OpenAI、Anthropic 等）
+//! - [`middleware`][]: 中间件拦截器 trait
 //!
 //! # 使用示例
 //!

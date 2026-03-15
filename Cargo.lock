@@ -411,9 +411,11 @@ dependencies = [
  "bytes",
  "colored",
  "flexi_logger",
+ "http-body-util",
  "hyper",
  "llm-router-lib",
  "log",
+ "serde_json",
  "tokio",
 ]
 
