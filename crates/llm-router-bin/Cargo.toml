@@ -1,0 +1,20 @@
+[package]
+name = "llm-router"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "llm-router"
+path = "src/main.rs"
+
+[dependencies]
+llm-router-lib = { path = "../llm-router-lib" }
+
+log = "0.4"
+flexi_logger = "0.31"
+colored = "3.1"
+
+tokio = { version = "1.50", features = ["rt-multi-thread"] }
+
+bytes = "1.0"
+hyper = { version = "1.8", features = ["http1"] }

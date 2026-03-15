@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{BackendConfig, Config, LoadBalancerConfig};
 use crate::health::BackendHealth;
+use crate::middleware::{InterceptAction, Middleware, RequestContext};
 use crate::protocol::{AnthropicProtocol, ModelInfo, OpenAiProtocol, Protocol};
 
 /// 通用响应体类型（用于非流式响应）
@@ -42,6 +43,7 @@ struct Server {
     router: Arc<HashMap<String, Box<[Box<str>]>>>,
     protocols: Vec<Arc<dyn Protocol>>,
     http_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    middleware: Arc<dyn Middleware>,
 }
 
 /// 运行时后端，包含配置和健康状态
@@ -51,7 +53,7 @@ struct Backend {
 }
 
 impl Server {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, middleware: Arc<dyn Middleware>) -> Self {
         let protocols: Vec<Arc<dyn Protocol>> =
             vec![Arc::new(OpenAiProtocol), Arc::new(AnthropicProtocol)];
 
@@ -93,6 +95,7 @@ impl Server {
             router: Arc::new(config.router),
             protocols,
             http_client,
+            middleware,
         }
     }
 
@@ -246,7 +249,7 @@ impl Server {
             .map(|(name, value)| (name, value.as_bytes().into()))
             .collect();
 
-        let body_bytes = match req.collect().await {
+        let mut body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
                 warn!("Failed to collect request body: {e}");
@@ -283,6 +286,44 @@ impl Server {
         match protocol.parse(body_bytes.clone()) {
             Ok(parsed) => {
                 info!("Matched protocol, model: {}", parsed.model);
+                
+                // 创建请求上下文
+                let context = RequestContext::new(parsed.model.clone(), path.clone());
+
+                // 构建可变请求用于中间件拦截 (使用 Bytes 作为 body 类型)
+                let mut req_builder = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/{}", path.trim_start_matches('/')));
+
+                // 重新构建请求头
+                for (name, value) in &original_headers {
+                    req_builder = req_builder.header(name, &**value);
+                }
+
+                let mut intercepted_req = req_builder
+                    .body(body_bytes.clone())
+                    .unwrap();
+
+                // 调用请求拦截器
+                match self.middleware.intercept_request(&mut intercepted_req, &context) {
+                    InterceptAction::Block(boxed_body) => {
+                        // 中间件阻止了请求，直接返回
+                        return Ok(Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(boxed_body)
+                            .unwrap());
+                    }
+                    InterceptAction::Continue => {
+                        // 继续处理，使用可能被修改的请求体
+                        // 从 intercepted_req 获取可能被修改的 body (Bytes 类型)
+                        body_bytes = intercepted_req.into_body();
+                    }
+                }
+                
+                // 重新构建 body_bytes 用于后续处理
+                // 注意：intercept_request 可以修改 intercepted_req 的 body
+                // 但这里我们简单处理，继续使用原始 body_bytes
+                
                 // 查找此模型的后端并尝试故障转移
                 self.handle_with_failover(
                     path,
@@ -522,11 +563,34 @@ impl Server {
                     parts.status
                 );
 
-                // 流式转发后端响应体
-                Ok(Response::from_parts(
-                    parts,
-                    body.map_err(std::io::Error::other).boxed(),
-                ))
+                // 收集响应体以便中间件拦截
+                let body_bytes = body.collect().await.unwrap().to_bytes();
+
+                // 构建可变响应 (使用 Bytes 作为 body 类型)
+                let mut intercepted_resp = Response::from_parts(parts.clone(), body_bytes);
+
+                // 创建响应上下文
+                let context = RequestContext::new(&params.original_model, &params.path)
+                    .with_backend(&params.backend_name);
+
+                // 调用响应拦截器
+                match self.middleware.intercept_response(&mut intercepted_resp, &context) {
+                    InterceptAction::Block(boxed_body) => {
+                        // 中间件阻止了响应，返回新响应
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(boxed_body)
+                            .unwrap());
+                    }
+                    InterceptAction::Continue => {
+                        // 使用可能被修改的响应
+                        let (parts, bytes_body) = intercepted_resp.into_parts();
+                        let boxed_body = Full::from(bytes_body)
+                            .map_err(std::io::Error::other)
+                            .boxed();
+                        return Ok(Response::from_parts(parts, boxed_body));
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -579,9 +643,12 @@ impl Server {
     }
 }
 
-pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn serve(
+    config: Config,
+    middleware: Arc<dyn Middleware>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = config.service.port;
-    let server = Server::new(config);
+    let server = Server::new(config, middleware);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     info!("Listening on http://{addr}");
